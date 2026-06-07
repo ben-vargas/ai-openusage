@@ -10,10 +10,31 @@ pub struct ProxyConfig {
     pub url: String,
 }
 
+/// Remote host whose local ccusage output should be merged into token/cost history.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum CcusageRemoteHostConfig {
+    Host(String),
+    Detailed { host: String, enabled: Option<bool> },
+}
+
+impl CcusageRemoteHostConfig {
+    fn enabled_host(&self) -> Option<String> {
+        match self {
+            CcusageRemoteHostConfig::Host(host) => enabled_remote_host(host, true),
+            CcusageRemoteHostConfig::Detailed { host, enabled } => {
+                enabled_remote_host(host, enabled.unwrap_or(true))
+            }
+        }
+    }
+}
+
 /// Top-level application config
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub proxy: Option<ProxyConfig>,
+    pub ccusage_remote_hosts: Option<Vec<CcusageRemoteHostConfig>>,
 }
 
 /// Resolved proxy state — computed once at startup, used per-request.
@@ -25,11 +46,25 @@ pub struct ResolvedProxy {
 
 /// Global resolved proxy: Some(active) or None(disabled).
 static RESOLVED_PROXY: OnceLock<Option<ResolvedProxy>> = OnceLock::new();
+static CCUSAGE_REMOTE_HOSTS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Returns the resolved proxy, or None if disabled/invalid/missing.
 /// Loaded once from disk on first call; subsequent calls are zero-cost.
 pub fn get_resolved_proxy() -> Option<&'static ResolvedProxy> {
-    RESOLVED_PROXY.get_or_init(|| load_and_resolve_proxy()).as_ref()
+    RESOLVED_PROXY
+        .get_or_init(|| load_and_resolve_proxy())
+        .as_ref()
+}
+
+/// Returns enabled SSH hosts configured for remote ccusage aggregation.
+pub fn get_ccusage_remote_hosts() -> &'static [String] {
+    CCUSAGE_REMOTE_HOSTS
+        .get_or_init(|| {
+            load_app_config()
+                .map(resolve_ccusage_remote_hosts)
+                .unwrap_or_default()
+        })
+        .as_slice()
 }
 
 /// Config file path: ~/.openusage/config.json
@@ -37,24 +72,38 @@ fn config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".openusage").join("config.json"))
 }
 
-/// Loads config from disk, resolves proxy, logs result.
-fn load_and_resolve_proxy() -> Option<ResolvedProxy> {
+fn load_app_config() -> Option<AppConfig> {
     let Some(path) = config_path() else {
-        log::debug!("[config] no home directory, proxy disabled");
+        log::debug!("[config] no home directory, using defaults");
         return None;
     };
-    let config = match std::fs::read_to_string(&path) {
+    match std::fs::read_to_string(&path) {
         Ok(contents) => match serde_json::from_str::<AppConfig>(&contents) {
-            Ok(cfg) => cfg,
+            Ok(cfg) => Some(cfg),
             Err(e) => {
-                log::warn!("[config] failed to parse {}: {}, using defaults", path.display(), e);
-                return None;
+                log::warn!(
+                    "[config] failed to parse {}: {}, using defaults",
+                    path.display(),
+                    e
+                );
+                None
             }
         },
         Err(_) => {
-            log::debug!("[config] no config file at {}, using defaults", path.display());
-            return None;
+            log::debug!(
+                "[config] no config file at {}, using defaults",
+                path.display()
+            );
+            None
         }
+    }
+}
+
+/// Loads config from disk, resolves proxy, logs result.
+fn load_and_resolve_proxy() -> Option<ResolvedProxy> {
+    let Some(config) = load_app_config() else {
+        log::debug!("[config] proxy disabled");
+        return None;
     };
 
     let Some(proxy_cfg) = config.proxy.as_ref().filter(|p| p.enabled) else {
@@ -78,6 +127,43 @@ fn load_and_resolve_proxy() -> Option<ResolvedProxy> {
             None
         }
     }
+}
+
+fn enabled_remote_host(host: &str, enabled: bool) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let host = host.trim();
+    if host.is_empty() || host.starts_with('-') {
+        return None;
+    }
+    if !host
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '@'))
+    {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+fn resolve_ccusage_remote_hosts(config: AppConfig) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for host in config.ccusage_remote_hosts.unwrap_or_default() {
+        let Some(host) = host.enabled_host() else {
+            continue;
+        };
+        if hosts.iter().any(|existing| existing == &host) {
+            continue;
+        }
+        hosts.push(host);
+    }
+    if !hosts.is_empty() {
+        log::debug!(
+            "[config] ccusage remote hosts enabled: {}",
+            hosts.join(", ")
+        );
+    }
+    hosts
 }
 
 /// Redacts user info from a proxy URL for safe logging.
@@ -122,6 +208,7 @@ mod tests {
                 enabled: false,
                 url: "http://127.0.0.1:10808".to_string(),
             }),
+            ccusage_remote_hosts: None,
         };
         assert!(config.proxy.as_ref().filter(|p| p.enabled).is_none());
     }
@@ -133,7 +220,31 @@ mod tests {
                 enabled: true,
                 url: "http://127.0.0.1:10808".to_string(),
             }),
+            ccusage_remote_hosts: None,
         };
         assert!(config.proxy.as_ref().filter(|p| p.enabled).is_some());
+    }
+
+    #[test]
+    fn resolves_enabled_ccusage_remote_hosts() {
+        let config = AppConfig {
+            proxy: None,
+            ccusage_remote_hosts: Some(vec![
+                CcusageRemoteHostConfig::Host("ben-mm".to_string()),
+                CcusageRemoteHostConfig::Detailed {
+                    host: "ben-mm".to_string(),
+                    enabled: Some(true),
+                },
+                CcusageRemoteHostConfig::Detailed {
+                    host: "disabled".to_string(),
+                    enabled: Some(false),
+                },
+                CcusageRemoteHostConfig::Host("-bad".to_string()),
+            ]),
+        };
+        assert_eq!(
+            resolve_ccusage_remote_hosts(config),
+            vec!["ben-mm".to_string()]
+        );
     }
 }

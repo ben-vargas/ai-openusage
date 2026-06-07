@@ -554,8 +554,29 @@ Returns a status envelope:
 - **Focused commands**: Uses `ccusage claude daily` or `ccusage codex daily`; it intentionally does not use `ccusage daily` because that aggregates all detected agents
 - **Legacy fallback**: If `ccusage@20.0.2` cannot run through the package manager release-age policy, retries with release-age-safe `ccusage@18.0.11` for Claude or `@ccusage/codex@18.0.11` for Codex
 - **No provider API calls**: Usage is computed from local JSONL session files; the host does not call Claude/Codex (or other provider) APIs, but package runners may contact a package registry to download the `ccusage` CLI if it is not already available locally
+- **Remote host aggregation**: If `~/.openusage/config.json` has `ccusageRemoteHosts`, the host also runs the same provider-focused daily command over SSH and merges matching days into `data.daily`. This only affects ccusage-derived token/cost history; provider live quota/account data remains local plugin behavior.
 - **Graceful degradation**: returns `no_runner` when no runner exists, `runner_failed` when execution fails
 - **Pricing**: Uses ccusage's built-in LiteLLM pricing data
+
+Remote aggregation config:
+
+```json
+{
+  "ccusageRemoteHosts": ["ben-mm"]
+}
+```
+
+Detailed form is also supported:
+
+```json
+{
+  "ccusageRemoteHosts": [
+    { "host": "ben-mm", "enabled": true }
+  ]
+}
+```
+
+SSH must already work with key-based auth. Remote commands use non-interactive SSH and enrich `PATH` for common macOS/node locations (`~/.bun/bin`, `~/.nvm/current/bin`, `/opt/homebrew/bin`, `/usr/local/bin`). Unreachable remote hosts are skipped; local usage still returns when available.
 
 ### DailyUsage
 

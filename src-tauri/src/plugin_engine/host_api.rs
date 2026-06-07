@@ -4,6 +4,7 @@ use aes_gcm::{
     aes::Aes256,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use crate::config::get_ccusage_remote_hosts;
 use rquickjs::{function::Rest, Ctx, Exception, Function, Object};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -1633,6 +1634,7 @@ const CCUSAGE_LEGACY_CLAUDE_PACKAGE_NAME: &str = "ccusage";
 const CCUSAGE_LEGACY_CODEX_PACKAGE_NAME: &str = "@ccusage/codex";
 const CCUSAGE_LEGACY_CODEX_BIN_NAME: &str = "ccusage-codex";
 const CCUSAGE_TIMEOUT_SECS: u64 = 15;
+const CCUSAGE_REMOTE_TIMEOUT_SECS: u64 = 20;
 const CCUSAGE_POLL_INTERVAL_MS: u64 = 100;
 
 #[derive(Default, serde::Deserialize)]
@@ -2085,6 +2087,428 @@ fn normalize_ccusage_output(stdout: &str) -> Option<String> {
     serde_json::to_string(&normalized).ok()
 }
 
+const CCUSAGE_MERGE_NUMERIC_FIELDS: &[&str] = &[
+    "inputTokens",
+    "outputTokens",
+    "cacheCreationTokens",
+    "cacheReadTokens",
+    "cachedInputTokens",
+    "totalTokens",
+    "totalCost",
+    "costUSD",
+];
+
+fn json_number_as_f64(value: &serde_json::Value) -> Option<f64> {
+    value.as_f64()
+}
+
+fn set_json_number(target: &mut serde_json::Map<String, serde_json::Value>, key: &str, value: f64) {
+    if let Some(number) = serde_json::Number::from_f64(value) {
+        target.insert(key.to_string(), serde_json::Value::Number(number));
+    }
+}
+
+fn sum_numeric_field(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    let Some(source_value) = source.get(key).and_then(json_number_as_f64) else {
+        return;
+    };
+    let total = target
+        .get(key)
+        .and_then(json_number_as_f64)
+        .unwrap_or(0.0)
+        + source_value;
+    set_json_number(target, key, total);
+}
+
+fn merge_model_breakdowns(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(source_models) = source.get("modelBreakdowns").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    let target_models = target
+        .entry("modelBreakdowns".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let Some(target_models) = target_models.as_array_mut() else {
+        return;
+    };
+
+    for source_model in source_models {
+        let Some(source_model_obj) = source_model.as_object() else {
+            continue;
+        };
+        let model_name = source_model_obj
+            .get("modelName")
+            .or_else(|| source_model_obj.get("model"))
+            .or_else(|| source_model_obj.get("name"))
+            .and_then(|v| v.as_str());
+        let Some(model_name) = model_name else {
+            target_models.push(source_model.clone());
+            continue;
+        };
+
+        let maybe_target = target_models.iter_mut().find(|target_model| {
+            target_model
+                .as_object()
+                .and_then(|obj| {
+                    obj.get("modelName")
+                        .or_else(|| obj.get("model"))
+                        .or_else(|| obj.get("name"))
+                })
+                .and_then(|v| v.as_str())
+                == Some(model_name)
+        });
+        let Some(target_model) = maybe_target else {
+            target_models.push(source_model.clone());
+            continue;
+        };
+        let Some(target_model_obj) = target_model.as_object_mut() else {
+            continue;
+        };
+        for key in CCUSAGE_MERGE_NUMERIC_FIELDS {
+            sum_numeric_field(target_model_obj, source_model_obj, key);
+        }
+    }
+}
+
+fn merge_named_model_objects(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(source_models) = source.get("models").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let target_models = target
+        .entry("models".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(target_models) = target_models.as_object_mut() else {
+        return;
+    };
+
+    for (model_name, source_model) in source_models {
+        let Some(source_model_obj) = source_model.as_object() else {
+            target_models
+                .entry(model_name.clone())
+                .or_insert_with(|| source_model.clone());
+            continue;
+        };
+        let target_model = target_models
+            .entry(model_name.clone())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let Some(target_model_obj) = target_model.as_object_mut() else {
+            continue;
+        };
+        for key in CCUSAGE_MERGE_NUMERIC_FIELDS {
+            sum_numeric_field(target_model_obj, source_model_obj, key);
+        }
+    }
+}
+
+fn merge_ccusage_day(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Map<String, serde_json::Value>,
+) {
+    for key in CCUSAGE_MERGE_NUMERIC_FIELDS {
+        sum_numeric_field(target, source, key);
+    }
+    merge_model_breakdowns(target, source);
+    merge_named_model_objects(target, source);
+}
+
+fn merge_ccusage_remote_data(target: &mut serde_json::Value, source: &serde_json::Value) -> bool {
+    let Some(source_days) = source.get("daily").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let Some(target_days) = target.get_mut("daily").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+
+    for source_day in source_days {
+        let Some(source_day_obj) = source_day.as_object() else {
+            continue;
+        };
+        let Some(source_date) = source_day_obj.get("date").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let maybe_target = target_days.iter_mut().find(|target_day| {
+            target_day.get("date").and_then(|v| v.as_str()) == Some(source_date)
+        });
+        match maybe_target.and_then(|target_day| target_day.as_object_mut()) {
+            Some(target_day_obj) => merge_ccusage_day(target_day_obj, source_day_obj),
+            None => target_days.push(source_day.clone()),
+        }
+    }
+
+    target_days.sort_by(|a, b| {
+        let a = a.get("date").and_then(|v| v.as_str()).unwrap_or_default();
+        let b = b.get("date").and_then(|v| v.as_str()).unwrap_or_default();
+        b.cmp(a)
+    });
+    true
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn remote_ccusage_shell_script(opts: &CcusageQueryOpts, provider: CcusageProvider) -> String {
+    let package_spec = ccusage_package_spec();
+    let config = ccusage_provider_config(provider);
+    let mut args = vec![
+        config.command_namespace.to_string(),
+        "daily".to_string(),
+        "--json".to_string(),
+        "--order".to_string(),
+        "desc".to_string(),
+    ];
+    if let Some(since) = opts
+        .since
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        args.push("--since".to_string());
+        args.push(since.to_string());
+    }
+    if let Some(until) = opts
+        .until
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        args.push("--until".to_string());
+        args.push(until.to_string());
+    }
+    let quoted_args = args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    format!(
+        r#"set -e
+nvm_default_bin=""
+if [ -f "$HOME/.nvm/alias/default" ]; then
+  nvm_default="$(cat "$HOME/.nvm/alias/default" 2>/dev/null || true)"
+  case "$nvm_default" in
+    "") ;;
+    v*) nvm_default_bin="$HOME/.nvm/versions/node/$nvm_default/bin" ;;
+    *) nvm_default_bin="$HOME/.nvm/versions/node/v$nvm_default/bin" ;;
+  esac
+fi
+PATH="$HOME/.bun/bin:$HOME/.nvm/current/bin${{nvm_default_bin:+:$nvm_default_bin}}:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH
+if command -v bunx >/dev/null 2>&1; then
+  exec bunx --silent {package_spec} {quoted_args}
+elif command -v pnpm >/dev/null 2>&1; then
+  exec pnpm -s dlx {package_spec} {quoted_args}
+elif command -v yarn >/dev/null 2>&1; then
+  exec yarn dlx -q {package_spec} {quoted_args}
+elif command -v npm >/dev/null 2>&1; then
+  exec npm exec --yes --package={package_spec} -- ccusage {quoted_args}
+elif command -v npx >/dev/null 2>&1; then
+  exec npx --yes {package_spec} {quoted_args}
+fi
+echo "openusage: no package runner found for remote ccusage" >&2
+exit 127
+"#,
+        package_spec = shell_quote(&package_spec),
+        quoted_args = quoted_args
+    )
+}
+
+fn run_remote_ccusage_query(
+    host: &str,
+    opts: &CcusageQueryOpts,
+    provider: CcusageProvider,
+    plugin_id: &str,
+    deadline: ProbeDeadline,
+) -> Option<serde_json::Value> {
+    if deadline.has_elapsed() {
+        log_probe_deadline_skip(plugin_id, "remote ccusage");
+        return None;
+    }
+    let timeout = deadline
+        .clamp_duration(Duration::from_secs(CCUSAGE_REMOTE_TIMEOUT_SECS))
+        .unwrap_or_else(|| Duration::from_secs(0));
+    if timeout < MIN_BLOCKING_TIMEOUT {
+        log_probe_deadline_skip(plugin_id, "remote ccusage");
+        return None;
+    }
+
+    let script = remote_ccusage_shell_script(opts, provider);
+    let mut command = std::process::Command::new("ssh");
+    command
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=1",
+            "--",
+            host,
+        ])
+        .arg(script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    log::info!("[plugin:{}] remote ccusage query via ssh {}", plugin_id, host);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            log::warn!(
+                "[plugin:{}] remote ccusage ssh spawn failed for {}: {}",
+                plugin_id,
+                host,
+                e
+            );
+            return None;
+        }
+    };
+    let mut stdout_reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut v);
+            v
+        })
+    });
+    let mut stderr_reader = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stderr, &mut v);
+            v
+        })
+    });
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = stdout_reader
+                    .take()
+                    .and_then(|reader| reader.join().ok())
+                    .unwrap_or_default();
+                let stderr = stderr_reader
+                    .take()
+                    .and_then(|reader| reader.join().ok())
+                    .unwrap_or_default();
+                if !status.success() {
+                    log::warn!(
+                        "[plugin:{}] remote ccusage failed for {}: {}",
+                        plugin_id,
+                        host,
+                        String::from_utf8_lossy(&stderr).trim()
+                    );
+                    return None;
+                }
+                let out = String::from_utf8_lossy(&stdout);
+                let normalized_json = match normalize_ccusage_output(&out) {
+                    Some(value) => value,
+                    None => {
+                        log::warn!(
+                            "[plugin:{}] remote ccusage output parse failed for {}",
+                            plugin_id,
+                            host
+                        );
+                        return None;
+                    }
+                };
+                return serde_json::from_str(&normalized_json).ok();
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    if let Err(e) = kill_ccusage_on_timeout(&mut child) {
+                        log::warn!(
+                            "[plugin:{}] remote ccusage process group kill failed for {}: {}",
+                            plugin_id,
+                            host,
+                            e
+                        );
+                        let _ = child.kill();
+                    }
+                    let _ = child.wait();
+                    let _ = stdout_reader.take().and_then(|reader| reader.join().ok());
+                    let _ = stderr_reader.take().and_then(|reader| reader.join().ok());
+                    log::warn!(
+                        "[plugin:{}] remote ccusage timed out after {} for {}",
+                        plugin_id,
+                        format_ccusage_timeout(timeout),
+                        host
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(CCUSAGE_POLL_INTERVAL_MS));
+            }
+            Err(e) => {
+                log::warn!(
+                    "[plugin:{}] remote ccusage wait failed for {}: {}",
+                    plugin_id,
+                    host,
+                    e
+                );
+                return None;
+            }
+        }
+    }
+}
+
+fn merge_configured_remote_ccusage(
+    data: &mut serde_json::Value,
+    opts: &CcusageQueryOpts,
+    provider: CcusageProvider,
+    plugin_id: &str,
+    deadline: ProbeDeadline,
+) {
+    let hosts = get_ccusage_remote_hosts();
+    if hosts.is_empty() {
+        return;
+    }
+
+    let mut merged_hosts = Vec::new();
+    let mut failed_hosts = Vec::new();
+    for host in hosts {
+        match run_remote_ccusage_query(host, opts, provider, plugin_id, deadline) {
+            Some(remote_data) if merge_ccusage_remote_data(data, &remote_data) => {
+                merged_hosts.push(serde_json::Value::String(host.clone()));
+            }
+            _ => failed_hosts.push(serde_json::Value::String(host.clone())),
+        }
+    }
+
+    if let Some(data_obj) = data.as_object_mut() {
+        if !merged_hosts.is_empty() {
+            data_obj.insert(
+                "remoteHosts".to_string(),
+                serde_json::Value::Array(merged_hosts),
+            );
+        }
+        if !failed_hosts.is_empty() {
+            data_obj.insert(
+                "remoteHostErrors".to_string(),
+                serde_json::Value::Array(failed_hosts),
+            );
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum CcusageRunnerResult {
     Success(String),
@@ -2335,6 +2759,7 @@ fn run_ccusage_query_with_runners<F>(
     opts: &CcusageQueryOpts,
     provider: CcusageProvider,
     plugin_id: &str,
+    deadline: ProbeDeadline,
     mut run: F,
 ) -> String
 where
@@ -2357,7 +2782,7 @@ where
     for (kind, program) in runners {
         match run(kind, &program, opts, provider, plugin_id) {
             CcusageRunnerResult::Success(result) => {
-                let data: serde_json::Value = match serde_json::from_str(&result) {
+                let mut data: serde_json::Value = match serde_json::from_str(&result) {
                     Ok(v) => v,
                     Err(e) => {
                         log::warn!(
@@ -2368,6 +2793,7 @@ where
                         continue;
                     }
                 };
+                merge_configured_remote_ccusage(&mut data, opts, provider, plugin_id, deadline);
                 return serde_json::json!({ "status": "ok", "data": data }).to_string();
             }
             CcusageRunnerResult::Failed => {}
@@ -2420,6 +2846,7 @@ fn inject_ccusage<'js>(
                     &opts,
                     provider,
                     &pid,
+                    deadline,
                     |kind, program, opts, provider, plugin_id| {
                         run_ccusage_with_runner_deadline(
                             kind, program, opts, provider, plugin_id, deadline,
@@ -4401,6 +4828,7 @@ Saved lockfile
             &opts,
             CcusageProvider::Codex,
             "codex",
+            ProbeDeadline::none(),
             |kind, _, _, _, _| {
                 calls.push(kind);
                 CcusageRunnerResult::TimedOut
@@ -4490,6 +4918,61 @@ esac
             format_ccusage_timeout(std::time::Duration::from_secs(CCUSAGE_TIMEOUT_SECS)),
             "15s"
         );
+    }
+
+    #[test]
+    fn merge_ccusage_remote_data_sums_matching_days_and_models() {
+        let mut local = serde_json::json!({
+            "daily": [
+                {
+                    "date": "2026-06-07",
+                    "inputTokens": 10,
+                    "outputTokens": 2,
+                    "cacheCreationTokens": 1,
+                    "cacheReadTokens": 3,
+                    "totalTokens": 16,
+                    "totalCost": 0.10,
+                    "modelBreakdowns": [
+                        { "modelName": "opus", "inputTokens": 10, "outputTokens": 2, "totalCost": 0.10 }
+                    ]
+                }
+            ]
+        });
+        let remote = serde_json::json!({
+            "daily": [
+                {
+                    "date": "2026-06-07",
+                    "inputTokens": 30,
+                    "outputTokens": 4,
+                    "cacheCreationTokens": 5,
+                    "cacheReadTokens": 6,
+                    "totalTokens": 45,
+                    "totalCost": 0.25,
+                    "modelBreakdowns": [
+                        { "modelName": "opus", "inputTokens": 30, "outputTokens": 4, "totalCost": 0.25 }
+                    ]
+                },
+                {
+                    "date": "2026-06-06",
+                    "inputTokens": 7,
+                    "outputTokens": 1,
+                    "totalTokens": 8,
+                    "totalCost": 0.03
+                }
+            ]
+        });
+
+        assert!(merge_ccusage_remote_data(&mut local, &remote));
+
+        assert_eq!(local["daily"][0]["date"], "2026-06-07");
+        assert_eq!(local["daily"][0]["inputTokens"], 40.0);
+        assert_eq!(local["daily"][0]["outputTokens"], 6.0);
+        assert_eq!(local["daily"][0]["cacheCreationTokens"], 6.0);
+        assert_eq!(local["daily"][0]["cacheReadTokens"], 9.0);
+        assert_eq!(local["daily"][0]["totalTokens"], 61.0);
+        assert!((local["daily"][0]["totalCost"].as_f64().unwrap() - 0.35).abs() < 0.000001);
+        assert_eq!(local["daily"][0]["modelBreakdowns"][0]["inputTokens"], 40.0);
+        assert_eq!(local["daily"][1]["date"], "2026-06-06");
     }
 
     #[test]
